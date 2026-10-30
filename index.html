@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>ESP32 Smart Face Door Lock</title>
+
+<script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+
+<style>
+body {
+  font-family: Arial, sans-serif;
+  background: #edf2f7;
+  padding: 15px;
+  color: #172033;
+}
+.container {
+  max-width: 520px;
+  margin: auto;
+}
+.card {
+  background: white;
+  padding: 18px;
+  border-radius: 14px;
+  margin-bottom: 14px;
+}
+h2 { margin-top: 0; }
+input, select, button {
+  width: 100%;
+  padding: 12px;
+  margin: 6px 0;
+  box-sizing: border-box;
+  border-radius: 8px;
+  font-size: 15px;
+}
+input, select { border: 1px solid #ccc; }
+button {
+  border: none;
+  background: #185abc;
+  color: white;
+  cursor: pointer;
+}
+.secondary {
+  background: #e4edff;
+  color: #173b72;
+}
+.danger { background: #ae2929; }
+video {
+  width: 100%;
+  background: black;
+  border-radius: 10px;
+  margin-top: 10px;
+}
+#status {
+  background: #edf2f7;
+  padding: 12px;
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+.small {
+  font-size: 12px;
+  color: #586477;
+  line-height: 1.5;
+}
+</style>
+</head>
+
+<body>
+<div class="container">
+
+<div class="card">
+  <h2>Face Recognition Door Lock</h2>
+
+  <label>ESP32 IP Address</label>
+  <input id="ip" placeholder="192.168.1.45">
+
+  <label>Access Key</label>
+  <input id="key" type="password"
+         placeholder="Enter Arduino access key">
+
+  <button class="secondary" onclick="checkStatus()">
+    Check ESP32
+  </button>
+
+  <button class="secondary" onclick="loadModels()">
+    Load Face Model
+  </button>
+
+  <p id="status">Ready to scan</p>
+</div>
+
+<div class="card">
+  <h3>Camera</h3>
+
+  <label>Select Camera</label>
+  <select id="cameras"></select>
+
+  <button class="secondary" onclick="findCameras()">
+    Find Cameras
+  </button>
+
+  <button onclick="startCamera()">
+    Start Camera
+  </button>
+
+  <video id="video" autoplay muted playsinline></video>
+</div>
+
+<div class="card">
+  <h3>Register Face</h3>
+
+  <label>Person Name</label>
+  <input id="name" placeholder="Enter person name">
+
+  <button onclick="registerFace()">Register Face</button>
+
+  <h3>Registered Persons</h3>
+  <p id="people">No registered faces</p>
+
+  <button class="danger" onclick="clearFaces()">
+    Delete Registered Faces
+  </button>
+</div>
+
+<div class="card">
+  <h3>Door Control</h3>
+
+  <button onclick="scanFace()">
+    Scan Face & Open Door
+  </button>
+
+  <button class="secondary" onclick="lockDoor()">
+    Close Door / Lock
+  </button>
+
+  <p class="small">
+    Registered face: unlock request.
+    Unknown face: access denied.
+    The ESP32 controls the servo, relay, buzzer and LCD.
+  </p>
+</div>
+
+<div class="card">
+  <p class="small">
+    Educational prototype only. It has no liveness detection.
+    A photograph may fool basic face recognition. Do not use as
+    the sole security mechanism for a real door.
+  </p>
+</div>
+
+</div>
+
+<script>
+const video = document.getElementById("video");
+const statusBox = document.getElementById("status");
+
+const MODEL_URL =
+"https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights";
+
+const STORAGE_KEY = "registeredFaceDoorLockV2";
+
+let modelsLoaded = false;
+let cameraStream = null;
+let faces = loadFaces();
+
+function show(message) {
+  statusBox.textContent = message;
+}
+
+function loadFaces() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function saveFaces() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(faces));
+  renderFaces();
+}
+
+function renderFaces() {
+  document.getElementById("people").textContent =
+    faces.length
+      ? faces.map(face => face.name).join(", ")
+      : "No registered faces";
+}
+
+function apiURL(path, extra = {}) {
+  const ip = document.getElementById("ip").value.trim();
+  const key = document.getElementById("key").value.trim();
+
+  if (!ip || !key) {
+    throw new Error("Enter ESP32 IP and access key.");
+  }
+
+  if (!/^[a-zA-Z0-9.-]+$/.test(ip)) {
+    throw new Error("Enter a valid ESP32 IP address.");
+  }
+
+  const params = new URLSearchParams({
+    key,
+    ...extra
+  });
+
+  return `http://${ip}${path}?${params.toString()}`;
+}
+
+async function loadModels() {
+  try {
+    if (!window.faceapi) {
+      throw new Error("Face API library did not load. Check Internet.");
+    }
+
+    show("Loading face recognition models...");
+
+    await Promise.all([
+      faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
+      faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+      faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
+    ]);
+
+    modelsLoaded = true;
+    show("Models loaded. Start camera.");
+    await findCameras();
+
+  } catch (error) {
+    show("Model error: " + error.message);
+  }
+}
+
+async function findCameras() {
+  try {
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      throw new Error("Camera needs HTTPS or localhost.");
+    }
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cameras = devices.filter(d => d.kind === "videoinput");
+    const select = document.getElementById("cameras");
+
+    select.innerHTML = "";
+
+    cameras.forEach((camera, index) => {
+      select.add(new Option(
+        camera.label || `Camera ${index + 1}`,
+        camera.deviceId
+      ));
+    });
+
+    if (!cameras.length) show("No camera found.");
+
+  } catch (error) {
+    show("Camera error: " + error.message);
+  }
+}
+
+async function startCamera() {
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error("Open dashboard using HTTPS or localhost.");
+    }
+
+    if (cameraStream) {
+      cameraStream.getTracks().forEach(track => track.stop());
+    }
+
+    const deviceId = document.getElementById("cameras").value;
+
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      video: deviceId
+        ? { deviceId: { exact: deviceId } }
+        : { facingMode: "user" },
+      audio: false
+    });
+
+    video.srcObject = cameraStream;
+    await video.play();
+
+    await findCameras();
+    show("Camera ready. Register or scan a face.");
+
+  } catch (error) {
+    show("Camera error: " + error.message);
+  }
+}
+
+async function getDescriptor() {
+  if (!modelsLoaded) throw new Error("Load face models first.");
+  if (!cameraStream || !video.videoWidth) {
+    throw new Error("Start camera first.");
+  }
+
+  const detection = await faceapi
+    .detectSingleFace(
+      video,
+      new faceapi.SsdMobilenetv1Options({
+        minConfidence: 0.5
+      })
+    )
+    .withFaceLandmarks()
+    .withFaceDescriptor();
+
+  if (!detection) {
+    throw new Error("No face detected. Improve lighting.");
+  }
+
+  return Array.from(detection.descriptor);
+}
+
+async function registerFace() {
+  try {
+    const name = document.getElementById("name").value.trim();
+
+    if (!name) throw new Error("Enter person name.");
+
+    const descriptor = await getDescriptor();
+
+    if (faces.some(f => f.name.toLowerCase() === name.toLowerCase())) {
+      throw new Error("This name is already registered.");
+    }
+
+    faces.push({ name, descriptor });
+    saveFaces();
+
+    show("Face registered: " + name);
+
+  } catch (error) {
+    show("Registration error: " + error.message);
+  }
+}
+
+function distance(a, b) {
+  let sum = 0;
+
+  for (let i = 0; i < a.length; i++) {
+    sum += (a[i] - b[i]) ** 2;
+  }
+
+  return Math.sqrt(sum);
+}
+
+async function scanFace() {
+  try {
+    if (!faces.length) {
+      throw new Error("Register a face first.");
+    }
+
+    show("Scanning face...");
+
+    const descriptor = await getDescriptor();
+
+    let best = null;
+    let bestDistance = Infinity;
+
+    for (const face of faces) {
+      const d = distance(descriptor, face.descriptor);
+
+      if (d < bestDistance) {
+        bestDistance = d;
+        best = face;
+      }
+    }
+
+    // Approximate demo threshold; test under different lighting.
+    if (!best || bestDistance >= 0.50) {
+      show("ACCESS DENIED: Unknown person.");
+
+      try {
+        await fetch(apiURL("/denied"), {
+          mode: "cors"
+        });
+      } catch (e) {
+        console.error("Denied notification failed:", e);
+      }
+
+      return;
+    }
+
+    show("ACCESS GRANTED: " + best.name);
+
+    const response = await fetch(
+      apiURL("/unlock", { name: best.name }),
+      { mode: "cors" }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok || !data.success) {
+      throw new Error(data.message || "Unlock command failed.");
+    }
+
+    show("ACCESS GRANTED: " + best.name +
+         ". Door opening. It will relock after 5 seconds.");
+
+  } catch (error) {
+    show("Scan error: " + error.message);
+  }
+}
+
+async function checkStatus() {
+  try {
+    const response = await fetch(apiURL("/status"), {
+      mode: "cors",
+      cache: "no-store"
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) throw new Error("Status request failed.");
+
+    show("ESP32 connected. Door: " +
+      (data.doorUnlocked ? "UNLOCKED" : "LOCKED"));
+
+  } catch (error) {
+    show("ESP32 error: " + error.message);
+  }
+}
+
+async function lockDoor() {
+  try {
+    const response = await fetch(apiURL("/lock"), {
+      mode: "cors"
+    });
+
+    const data = await response.json();
+
+    if (!response.ok || !data.success) {
+      throw new Error(data.message || "Lock failed.");
+    }
+
+    show("Lock command sent.");
+
+  } catch (error) {
+    show("Lock error: " + error.message);
+  }
+}
+
+function clearFaces() {
+  if (confirm("Delete all registered face descriptors?")) {
+    faces = [];
+    localStorage.removeItem(STORAGE_KEY);
+    renderFaces();
+    show("All registered faces deleted.");
+  }
+}
+
+renderFaces();
+</script>
+</body>
+</html>
